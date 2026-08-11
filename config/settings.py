@@ -59,6 +59,9 @@ class Settings:
 
     # Data source
     data_source: str = field(default_factory=lambda: os.getenv("DATA_SOURCE", "mock").lower())
+    listam_max_pages: int = field(default_factory=lambda: _int("LISTAM_MAX_PAGES", 2))
+    listam_request_delay_sec: float = field(default_factory=lambda: _float("LISTAM_REQUEST_DELAY_SEC", 0.5))
+    listam_language: str = field(default_factory=lambda: os.getenv("LISTAM_LANGUAGE", "en"))
 
     # Filters
     city: str = field(default_factory=lambda: os.getenv("CITY", "Yerevan"))

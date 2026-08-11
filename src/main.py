@@ -36,7 +36,11 @@ def get_source(settings: Settings, run_index: int = 0):
     if settings.data_source == "mock":
         return MockListingSource(run_index=run_index)
     if settings.data_source == "listam":
-        return ListAmSource()
+        return ListAmSource(
+            max_pages=settings.listam_max_pages,
+            request_delay_sec=settings.listam_request_delay_sec,
+            language=settings.listam_language,
+        )
     raise ValueError(f"Unknown DATA_SOURCE: {settings.data_source}")
 
 
