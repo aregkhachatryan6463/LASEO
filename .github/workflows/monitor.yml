@@ -1,0 +1,64 @@
+name: Real Estate Deal Monitor
+
+# Runs on a schedule roughly every 5 minutes. GitHub Actions does NOT
+# guarantee exact timing for scheduled ("cron") workflows -- under load,
+# GitHub can delay a run by several minutes, and very frequent schedules
+# (like every 5 minutes) are especially likely to be delayed or occasionally
+# skipped. This is a known GitHub limitation, not a bug in this project.
+# The application is idempotent (see src/database) so delayed/occasionally
+# skipped/overlapping runs cannot cause duplicate Telegram alerts or lost
+# listings -- the next run just catches up.
+#
+# If you need closer-to-real-time execution than GitHub Actions can
+# reliably provide, see README.md section "Alternative: Cloudflare Workers"
+# for a free alternative with cron triggers that are generally more precise.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}   # lets you click "Run workflow" manually in the Actions tab
+
+# Prevent overlapping runs from racing each other on the SQLite file.
+concurrency:
+  group: real-estate-monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # needed to commit the updated database back to the repo
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run monitoring cycle
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          AI_PROVIDER: ${{ secrets.AI_PROVIDER }}
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          DATA_SOURCE: ${{ vars.DATA_SOURCE || 'mock' }}
+          CITY: ${{ vars.CITY || 'Yerevan' }}
+        run: python -m src.main --production
+
+      - name: Commit updated database (persistence across runs)
+        run: |
+          git config user.name "real-estate-deal-finder-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/listings.db
+          # Only commit if something actually changed, to avoid empty commits every 5 minutes.
+          git diff --cached --quiet || git commit -m "Update listings database [skip ci]"
+          git push

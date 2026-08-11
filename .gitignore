@@ -1,0 +1,15 @@
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.DS_Store
+.venv/
+venv/
+
+# NOTE: data/listings.db is intentionally NOT ignored.
+# We commit the SQLite database back to the repo from GitHub Actions
+# so the bot remembers listings between scheduled runs.
+# See README.md section "How the bot remembers listings" for why.
+!data/
+!data/.gitkeep
