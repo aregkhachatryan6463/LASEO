@@ -31,6 +31,16 @@ CATEGORY_IDS: Dict[str, int] = {
 # n=1&gl=1 => Yerevan (city group 1)
 YEREVAN_QUERY = "n=1&gl=1"
 
+# Try several browser profiles; Cloudflare is pickier from datacenter IPs (e.g. GitHub Actions).
+_IMPERSONATES = (
+    "chrome131",
+    "chrome124",
+    "chrome120",
+    "chrome110",
+    "safari17_0",
+    "edge101",
+)
+
 
 class ListAmSource(ListingSource):
     name = "listam"
@@ -39,7 +49,32 @@ class ListAmSource(ListingSource):
         self.max_pages = max(1, max_pages)
         self.request_delay_sec = max(0.0, request_delay_sec)
         self.language = language.strip("/") or "en"
-        self._session = cf_requests.Session(impersonate="chrome")
+        self._session: Optional[cf_requests.Session] = None
+        self._impersonate_index = 0
+        self._warmed = False
+
+    def _get_session(self) -> cf_requests.Session:
+        if self._session is None:
+            profile = _IMPERSONATES[self._impersonate_index % len(_IMPERSONATES)]
+            self._session = cf_requests.Session(impersonate=profile)
+        return self._session
+
+    def _rotate_session(self) -> None:
+        self._impersonate_index += 1
+        profile = _IMPERSONATES[self._impersonate_index % len(_IMPERSONATES)]
+        logger.info(f"Rotating List.am HTTP session to impersonate={profile}")
+        self._session = cf_requests.Session(impersonate=profile)
+        self._warmed = False
+
+    def _warm_session(self) -> None:
+        if self._warmed:
+            return
+        session = self._get_session()
+        try:
+            session.get(f"https://www.list.am/{self.language}/", timeout=30)
+            self._warmed = True
+        except Exception as exc:
+            logger.warning(f"List.am homepage warmup failed: {exc}")
 
     def _category_url(self, category_id: int, page: int) -> str:
         base = f"https://www.list.am/{self.language}/category/{category_id}"
@@ -49,21 +84,44 @@ class ListAmSource(ListingSource):
 
     def _fetch_page(self, category_id: int, page: int) -> str:
         url = self._category_url(category_id, page)
-        try:
-            response = self._session.get(url, timeout=30)
-        except Exception as exc:
-            raise SourceUnavailableError(f"List.am request failed for {url}: {exc}") from exc
+        last_error: Optional[Exception] = None
 
-        if response.status_code != 200:
-            raise SourceUnavailableError(
-                f"List.am returned HTTP {response.status_code} for {url} "
-                f"(Cloudflare block or temporary outage)."
-            )
+        for attempt in range(len(_IMPERSONATES)):
+            if attempt:
+                self._rotate_session()
+            self._warm_session()
+            session = self._get_session()
+            try:
+                response = session.get(
+                    url,
+                    timeout=30,
+                    headers={
+                        "Accept-Language": "en-US,en;q=0.9,hy;q=0.8",
+                        "Referer": f"https://www.list.am/{self.language}/category/{category_id}",
+                    },
+                )
+            except Exception as exc:
+                last_error = exc
+                logger.warning(f"List.am request error (attempt {attempt + 1}): {exc}")
+                continue
 
-        if "Just a moment" in response.text[:2000]:
-            raise SourceUnavailableError("List.am blocked this request (Cloudflare challenge page).")
+            if response.status_code == 403 or "Just a moment" in response.text[:2000]:
+                last_error = SourceUnavailableError(
+                    f"List.am blocked request for {url} (HTTP {response.status_code})."
+                )
+                logger.warning(f"List.am Cloudflare block (attempt {attempt + 1})")
+                continue
 
-        return response.text
+            if response.status_code != 200:
+                raise SourceUnavailableError(
+                    f"List.am returned HTTP {response.status_code} for {url}."
+                )
+
+            return response.text
+
+        raise SourceUnavailableError(
+            f"List.am request failed for {url} after {len(_IMPERSONATES)} attempts: {last_error}"
+        )
 
     def fetch_listings(self, city: str, property_types: List[str]) -> List[Listing]:
         if city and city.lower() not in ("yerevan", "երevan", "erevan"):
