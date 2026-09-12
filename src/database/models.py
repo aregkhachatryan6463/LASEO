@@ -93,6 +93,9 @@ CREATE TABLE IF NOT EXISTS telegram_users (
     exceptional_enabled INTEGER NOT NULL DEFAULT 1,
     notifications_enabled INTEGER NOT NULL DEFAULT 1,
     blocked INTEGER NOT NULL DEFAULT 0,
+    min_price_usd REAL,
+    max_price_usd REAL,
+    pending_input TEXT,
     created_at TEXT,
     updated_at TEXT,
     last_seen_at TEXT

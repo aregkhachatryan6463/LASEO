@@ -6,18 +6,25 @@ Two responsibilities, both implemented as plain HTTP calls to the Bot API
 
   1. send_deal_alert() / send_daily_summary() -- push a message to ONE
      specific user's chat. Called once per qualifying user from
-     src/main.py's monitoring cycle.
+     src/main.py's monitoring cycle. The alert itself is kept SHORT on
+     purpose (fast to skim while browsing many listings); the score math
+     and "why" explanation are one tap away instead of always inline.
 
-  2. process_telegram_updates() -- a SHORT poll of getUpdates (the offset
-     is stored in the `bot_state` table so it survives between runs) that
+  2. process_telegram_updates() -- a poll of getUpdates (the offset is
+     stored in the `bot_state` table so it survives between runs) that
      handles incoming commands (/start, /settings, /stop, /top, /today,
-     /status, /how, /help) and inline-button taps (the Good/Excellent/
-     Exceptional toggles). This is called once per monitoring cycle
-     (roughly every 5 minutes, same schedule as listing checks), so no
-     separate always-on bot process is required.
+     /status, /how, /help), inline-button taps (classification toggles,
+     Score Breakdown, Why This Deal, price range), and a plain-text reply
+     when a user is in the middle of setting their price range. This runs
+     once per monitoring cycle, so no separate always-on bot process is
+     required -- but it also means replies to a button tap or a typed
+     price range only appear on the NEXT scheduled run (or immediately if
+     you click "Run workflow" on GitHub yourself).
 """
 from __future__ import annotations
 
+import json
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List
 
@@ -28,8 +35,6 @@ from src.analysis.scoring import (
     ALERT_CLASSIFICATIONS,
     classification_label,
     format_how_laseo_scores,
-    why_laseo_likes,
-    why_it_may_not_be_a_deal,
 )
 from src.models.listing import ProcessedListing
 from src.utils.logging import logger
@@ -52,99 +57,67 @@ def _post(settings: Settings, method: str, payload: dict) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Deal alert formatting + sending
+# Deal alert -- kept short, with the real link inline (so Telegram shows a
+# photo preview) and the deeper detail one tap away.
 # ---------------------------------------------------------------------------
-
-def format_score_breakdown(processed: ProcessedListing) -> str:
-    """
-    Renders the ACTUAL structured score components produced by
-    src/analysis/scoring.py -- this text can never drift from the real
-    formula because it is generated from the same ScoreComponent objects
-    used to compute processed.score.final_score.
-    """
-    s = processed.score
-    lines = ["🧮 HOW LASEO SCORED IT", ""]
-    for c in s.components:
-        lines.append(f"{c.name}: {c.raw_score:.0f}/100 × {c.weight * 100:.0f}% = {c.contribution:+.1f}")
-    for p in s.penalties:
-        lines.append(f"{p.name} (penalty): {p.contribution:+.1f}")
-    lines.append("")
-    lines.append(f"FINAL: {s.final_score:.0f}/100  ({s.classification})")
-    lines.append(f"Formula version: {s.formula_version}")
-    return "\n".join(lines)
-
 
 def format_deal_message(processed: ProcessedListing) -> str:
     l = processed.listing
     m = processed.market
-    ai = processed.ai
     s = processed.score
 
     icon = {"EXCEPTIONAL": "🚨", "EXCELLENT": "🔥", "GOOD": "🟢", "INTERESTING": "🟡"}.get(s.classification, "🏠")
     label = classification_label(s.classification)
 
-    lines = [f"{icon} {label} DEAL", ""]
+    lines = [f"{icon} {label} — {s.final_score:.0f}/100", ""]
     if l.neighborhood or l.district:
         lines.append(f"📍 {l.neighborhood or l.district}, {l.city or 'Yerevan'}")
-    lines.append(f"🏠 {l.title}")
 
     facts = []
     if l.rooms:
         facts.append(f"{l.rooms} rooms")
     if l.area_sqm:
         facts.append(f"{l.area_sqm:.0f} m²")
-    if facts:
-        lines.append("📐 " + " · ".join(facts))
-    if l.floor and l.total_floors:
-        lines.append(f"🏢 {l.floor}/{l.total_floors}")
     if l.renovation_status:
-        lines.append(f"🛠 {l.renovation_status.replace('_', ' ').title()}")
+        facts.append(l.renovation_status.replace("_", " ").title())
+    if facts:
+        lines.append("🏠 " + " · ".join(facts))
 
+    price_line = ""
     if l.price:
-        lines.append(f"\n💰 ${l.price:,.0f}")
-    if l.price_per_sqm:
-        lines.append(f"💵 ${l.price_per_sqm:,.0f}/m²")
+        price_line = f"💰 ${l.price:,.0f}"
+        if l.price_per_sqm:
+            price_line += f"  (${l.price_per_sqm:,.0f}/m²)"
+    if price_line:
+        lines.append(price_line)
 
-    lines.append("\n━━━━━━━━━━━━━━")
-    lines.append("🎯 MARKET")
-    if m.estimated_market_price_per_sqm:
-        lines.append(f"Estimated market price: ${m.estimated_market_price_per_sqm:,.0f}/m²")
     if m.discount_percentage is not None:
         direction = "below" if m.discount_percentage >= 0 else "above"
-        lines.append(f"Estimated discount: ~{abs(m.discount_percentage):.0f}% {direction} market")
-    lines.append(f"Data confidence: {m.confidence.upper()} ({m.comparable_count} comparable listing(s))")
+        lines.append(f"📉 ~{abs(m.discount_percentage):.0f}% {direction} market")
 
-    lines.append("\n━━━━━━━━━━━━━━")
-    lines.append(f"{icon} DEAL SCORE: {s.final_score:.0f}/100")
-
-    likes = why_laseo_likes(l, m, ai, s)
-    if likes:
-        lines.append("\n🧠 WHY LASEO LIKES IT")
-        lines += [f"• {b}" for b in likes]
-
-    risks = why_it_may_not_be_a_deal(l, m, ai)
-    if risks:
-        lines.append("\n⚠️ WHAT TO CHECK")
-        lines += [f"• {b}" for b in risks]
-
-    lines.append("\n" + format_score_breakdown(processed))
-
-    lines.append(
-        "\nEstimated market value is based on available comparable listings -- "
-        "this is not a professional appraisal."
-    )
+    if l.url:
+        # A plain URL in the message text (not just a button) is what makes
+        # Telegram generate a link preview with the listing's photo.
+        lines.append("")
+        lines.append(l.url)
 
     return "\n".join(lines)
 
 
-def _deal_alert_keyboard(listing_url: str) -> Optional[dict]:
-    if not listing_url:
-        return None
-    return {"inline_keyboard": [[{"text": "🔗 Open Listing", "url": listing_url}]]}
+def _deal_alert_keyboard(listing_id: str, listing_url: str) -> dict:
+    rows = [
+        [
+            {"text": "🧮 Score Breakdown", "callback_data": f"breakdown:{listing_id}"},
+            {"text": "🧠 Why This Deal", "callback_data": f"why:{listing_id}"},
+        ]
+    ]
+    if listing_url:
+        rows.append([{"text": "🔗 Open Listing", "url": listing_url}])
+    return {"inline_keyboard": rows}
 
 
 def send_deal_alert(settings: Settings, processed: ProcessedListing, chat_id: str) -> Optional[int]:
-    """Send one deal alert to one specific chat_id (one recipient)."""
+    """Send one short deal alert to one specific chat_id (one recipient)."""
     text = format_deal_message(processed)
     if settings.dry_run:
         logger.info(f"[DRY RUN] Would send Telegram alert to {chat_id}:\n{text}")
@@ -152,12 +125,9 @@ def send_deal_alert(settings: Settings, processed: ProcessedListing, chat_id: st
     payload = {
         "chat_id": chat_id,
         "text": text,
-        "parse_mode": "HTML",
         "disable_web_page_preview": False,
+        "reply_markup": _deal_alert_keyboard(processed.listing.listing_id, processed.listing.url),
     }
-    markup = _deal_alert_keyboard(processed.listing.url)
-    if markup:
-        payload["reply_markup"] = markup
     result = _post(settings, "sendMessage", payload)
     if result and result.get("ok"):
         return result["result"]["message_id"]
@@ -184,7 +154,7 @@ def send_plain_message(settings: Settings, chat_id, text: str, reply_markup: Opt
     if settings.dry_run:
         logger.info(f"[DRY RUN] Would send message to {chat_id}:\n{text}")
         return None
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    payload = {"chat_id": chat_id, "text": text}
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
     result = _post(settings, "sendMessage", payload)
@@ -194,7 +164,63 @@ def send_plain_message(settings: Settings, chat_id, text: str, reply_markup: Opt
 
 
 # ---------------------------------------------------------------------------
-# /settings inline keyboard (per-user Good/Excellent/Exceptional toggles)
+# On-demand detail: rebuilt from the DATABASE, not from the live object --
+# this is what lets a button tap work even long after the alert was sent
+# and the original run has ended.
+# ---------------------------------------------------------------------------
+
+def _confidence_from_comparable_count(count: int) -> str:
+    """Mirrors src/analysis/market.py's thresholds exactly."""
+    if count >= 8:
+        return "high"
+    if count >= 4:
+        return "medium"
+    return "low"
+
+
+def format_score_breakdown_from_row(row: dict) -> str:
+    breakdown = json.loads(row["score_breakdown"]) if row.get("score_breakdown") else {}
+    lines = [f"🧮 HOW LASEO SCORED: {row.get('title', 'this listing')}", ""]
+    for c in breakdown.get("components", []):
+        lines.append(f"{c['name']}: {c['raw_score']:.0f}/100 × {c['weight'] * 100:.0f}% = {c['contribution']:+.1f}")
+    for p in breakdown.get("penalties", []):
+        lines.append(f"{p['name']} (penalty): {p['contribution']:+.1f}")
+    lines.append("")
+    lines.append(f"FINAL: {breakdown.get('final_score', row.get('final_deal_score', 0)):.0f}/100 "
+                 f"({breakdown.get('classification', row.get('deal_classification', ''))})")
+    if breakdown.get("formula_version"):
+        lines.append(f"Formula version: {breakdown['formula_version']}")
+    return "\n".join(lines)
+
+
+def format_why_from_row(row: dict) -> str:
+    positives = json.loads(row["ai_positive_factors"]) if row.get("ai_positive_factors") else []
+    risks = json.loads(row["ai_risk_factors"]) if row.get("ai_risk_factors") else []
+    comparable_count = row.get("comparable_count") or 0
+    confidence = _confidence_from_comparable_count(comparable_count)
+
+    lines = [f"🧠 WHY THIS DEAL: {row.get('title', '')}", ""]
+    if row.get("discount_percentage") is not None:
+        direction = "below" if row["discount_percentage"] >= 0 else "above"
+        lines.append(f"• Priced ~{abs(row['discount_percentage']):.0f}% {direction} estimated market value")
+    if positives:
+        for p in positives:
+            lines.append(f"• {p}")
+    lines.append("")
+    lines.append(f"Data confidence: {confidence.upper()} ({comparable_count} comparable listing(s))")
+    if risks:
+        lines.append("\n⚠️ WHAT TO CHECK")
+        for r in risks:
+            lines.append(f"• {r}")
+    lines.append(
+        "\nEstimated market value is based on available comparable listings -- "
+        "this is not a professional appraisal."
+    )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# /settings: classification toggles + price range
 # ---------------------------------------------------------------------------
 
 _PREF_FIELDS = [
@@ -205,25 +231,75 @@ _PREF_FIELDS = [
 _PREF_ICONS = {"good_enabled": "🟢", "excellent_enabled": "🔵", "exceptional_enabled": "🔥"}
 
 
+def _format_price_range(user: dict) -> str:
+    lo, hi = user.get("min_price_usd"), user.get("max_price_usd")
+    if lo is None and hi is None:
+        return "Any price"
+    if lo is not None and hi is not None:
+        return f"${lo:,.0f} – ${hi:,.0f}"
+    if lo is not None:
+        return f"${lo:,.0f}+"
+    return f"Up to ${hi:,.0f}"
+
+
 def format_settings_text(user: dict) -> str:
     lines = ["⚙️ YOUR ALERTS", ""]
     for field, _cb, label in _PREF_FIELDS:
         state = "ON" if user.get(field) else "OFF"
         lines.append(f"{_PREF_ICONS[field]} {label}: {state}")
+    lines.append(f"💵 Price range: {_format_price_range(user)}")
     lines.append("")
     if not user.get("notifications_enabled", 1):
         lines.append("⏸ All notifications are currently paused. Send /start to resume.")
     else:
-        lines.append("Tap a button below to turn a deal type on or off.")
+        lines.append("Tap a button below to change it.")
     return "\n".join(lines)
 
 
 def build_settings_keyboard(user: dict) -> dict:
-    row = []
+    rows = []
     for field, cb, label in _PREF_FIELDS:
         mark = "✅" if user.get(field) else "⬜️"
-        row.append({"text": f"{mark} {_PREF_ICONS[field]} {label}", "callback_data": cb})
-    return {"inline_keyboard": [[b] for b in row]}
+        rows.append([{"text": f"{mark} {_PREF_ICONS[field]} {label}", "callback_data": cb}])
+    rows.append([{"text": f"💵 Price range: {_format_price_range(user)} (tap to change)", "callback_data": "setprice"}])
+    return {"inline_keyboard": rows}
+
+
+_PRICE_RANGE_RE = re.compile(r"^\s*\$?([\d,]+(?:\.\d+)?)\s*(?:-|to|–)\s*\$?([\d,]+(?:\.\d+)?)\s*$", re.IGNORECASE)
+_PRICE_MIN_ONLY_RE = re.compile(r"^\s*\$?([\d,]+(?:\.\d+)?)\s*\+\s*$")
+_PRICE_MAX_ONLY_RE = re.compile(r"^\s*(?:up to|under|max)\s*\$?([\d,]+(?:\.\d+)?)\s*$", re.IGNORECASE)
+
+
+def _parse_price_range(text: str):
+    """
+    Returns (min_price, max_price, error_message). On success error_message
+    is None. Accepts: "50000-150000", "50000 to 150000", "100000+",
+    "under 200000", and "any"/"clear"/"no limit" to remove the filter.
+    """
+    text = text.strip()
+    if text.lower() in ("any", "clear", "no limit", "none", "reset"):
+        return None, None, None
+
+    m = _PRICE_RANGE_RE.match(text)
+    if m:
+        lo = float(m.group(1).replace(",", ""))
+        hi = float(m.group(2).replace(",", ""))
+        if lo > hi:
+            lo, hi = hi, lo
+        return lo, hi, None
+
+    m = _PRICE_MIN_ONLY_RE.match(text)
+    if m:
+        return float(m.group(1).replace(",", "")), None, None
+
+    m = _PRICE_MAX_ONLY_RE.match(text)
+    if m:
+        return None, float(m.group(1).replace(",", "")), None
+
+    return None, None, (
+        "I didn't understand that. Reply with a range like 50000-150000, "
+        "or \"under 200000\", or \"any\" to remove the price filter."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +331,7 @@ def _answer_callback(settings: Settings, callback_query_id: str, text: str = "")
 
 
 def _edit_message(settings: Settings, chat_id, message_id, text: str, reply_markup: Optional[dict] = None) -> None:
-    payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML"}
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
     _post(settings, "editMessageText", payload)
@@ -295,6 +371,7 @@ def _handle_settings(settings: Settings, db, user_id: int, chat_id) -> None:
         excellent_enabled=settings.default_excellent_enabled,
         exceptional_enabled=settings.default_exceptional_enabled,
     )
+    db.set_pending_input(user_id, None)  # cancel any half-finished price-range prompt
     send_plain_message(settings, chat_id, format_settings_text(user), reply_markup=build_settings_keyboard(user))
 
 
@@ -343,15 +420,41 @@ def _handle_how(settings: Settings, chat_id) -> None:
 def _handle_help(settings: Settings, chat_id) -> None:
     send_plain_message(
         settings, chat_id,
-        "/settings - choose which deal types you get\n"
+        "/settings - choose which deal types you get, and your price range\n"
         "/top - all-time top deals\n"
         "/today - today's deals\n"
         "/how - how LASEO scores deals\n"
         "/status - last monitoring run\n"
         "/stop - pause your alerts\n"
         "/start - resume / restart\n"
-        "/help - this message",
+        "/help - this message\n\n"
+        "Tip: I only check Telegram once per scheduled run, so a button tap or a typed "
+        "reply may take until the next run to show up -- or trigger it immediately "
+        "yourself from GitHub's Actions tab with \"Run workflow\".",
     )
+
+
+def _handle_setprice_prompt(settings: Settings, db, user_id: int, chat_id) -> None:
+    db.set_pending_input(user_id, "price_range")
+    send_plain_message(
+        settings, chat_id,
+        "💵 What price range should I alert you for?\n\n"
+        "Reply with something like:\n"
+        "50000-150000\n"
+        "under 200000\n"
+        "100000+\n\n"
+        "Or reply \"any\" to remove the price filter.",
+    )
+
+
+def _handle_price_reply(settings: Settings, db, user_id: int, chat_id, text: str) -> None:
+    lo, hi, error = _parse_price_range(text)
+    if error:
+        send_plain_message(settings, chat_id, error)
+        return
+    user = db.set_price_range(user_id, lo, hi)
+    send_plain_message(settings, chat_id, f"✅ Price range set to: {_format_price_range(user)}")
+    send_plain_message(settings, chat_id, format_settings_text(user), reply_markup=build_settings_keyboard(user))
 
 
 def _handle_callback(settings: Settings, db, callback_query: dict) -> None:
@@ -363,13 +466,42 @@ def _handle_callback(settings: Settings, db, callback_query: dict) -> None:
     chat_id = (message.get("chat", {}) or {}).get("id")
     message_id = message.get("message_id")
 
+    if user_id is None:
+        _answer_callback(settings, cq_id)
+        return
+
+    if data.startswith("breakdown:"):
+        listing_id = data.split(":", 1)[1]
+        row = db.get_listing_analysis_row(listing_id)
+        _answer_callback(settings, cq_id)
+        if row:
+            send_plain_message(settings, chat_id, format_score_breakdown_from_row(row))
+        else:
+            send_plain_message(settings, chat_id, "Sorry, I couldn't find that listing's details anymore.")
+        return
+
+    if data.startswith("why:"):
+        listing_id = data.split(":", 1)[1]
+        row = db.get_listing_analysis_row(listing_id)
+        _answer_callback(settings, cq_id)
+        if row:
+            send_plain_message(settings, chat_id, format_why_from_row(row))
+        else:
+            send_plain_message(settings, chat_id, "Sorry, I couldn't find that listing's details anymore.")
+        return
+
+    if data == "setprice":
+        _answer_callback(settings, cq_id)
+        _handle_setprice_prompt(settings, db, user_id, chat_id)
+        return
+
     field_map = {
         "toggle:good": "good_enabled",
         "toggle:excellent": "excellent_enabled",
         "toggle:exceptional": "exceptional_enabled",
     }
     field = field_map.get(data)
-    if not field or user_id is None:
+    if not field:
         _answer_callback(settings, cq_id)
         return
 
@@ -388,9 +520,7 @@ def _handle_callback(settings: Settings, db, callback_query: dict) -> None:
 def process_telegram_updates(settings: Settings, db) -> int:
     """
     Fetch any Telegram updates since the last stored offset, handle them,
-    and advance the offset. Safe to call every ~5 minutes from the same job
-    that checks listings -- no separate long-running bot process needed.
-    Returns the number of updates processed (for logging).
+    and advance the offset. Returns the number of updates processed.
     """
     if not settings.telegram_bot_token:
         return 0
@@ -415,7 +545,8 @@ def process_telegram_updates(settings: Settings, db) -> int:
                 if db.get_user(user_id):
                     db.touch_user(user_id, chat_id=str(chat_id))
 
-                command = text.split()[0].split("@")[0].lower()
+                is_command = text.startswith("/")
+                command = text.split()[0].split("@")[0].lower() if is_command else ""
                 username = from_user.get("username")
                 first_name = from_user.get("first_name")
 
@@ -436,6 +567,11 @@ def process_telegram_updates(settings: Settings, db) -> int:
                     _handle_how(settings, chat_id)
                 elif command == "/help":
                     _handle_help(settings, chat_id)
+                elif not is_command:
+                    user = db.get_user(user_id)
+                    if user and user.get("pending_input") == "price_range":
+                        _handle_price_reply(settings, db, user_id, chat_id, text)
+                    # Otherwise: plain chit-chat with no pending question -- ignore quietly.
         except Exception as e:
             logger.error(f"Failed to process Telegram update {update.get('update_id')}: {e}")
         finally:

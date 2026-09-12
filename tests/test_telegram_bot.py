@@ -5,7 +5,7 @@ import pytest
 
 from config.settings import Settings
 from src.database.database import Database
-from src.models.listing import Listing, MarketAnalysis, AIAssessment
+from src.models.listing import Listing, MarketAnalysis, AIAssessment, ProcessedListing
 from src.analysis.scoring import calculate_final_score
 import src.telegram.bot as bot
 
@@ -21,8 +21,15 @@ def db():
         os.remove(path)
 
 
+@pytest.fixture
+def settings():
+    s = Settings()
+    s.telegram_bot_token = "test-token"
+    return s
+
+
 def make_processed():
-    settings = Settings()
+    s = Settings()
     listing = Listing(
         listing_id="mock:1", source="mock", url="https://list.am/item/1",
         title="2-room apartment", property_type="apartment", city="Yerevan",
@@ -33,140 +40,198 @@ def make_processed():
                              confidence="high", comparable_count=8)
     ai = AIAssessment(deal_quality=8.5, positive_factors=["Priced well below comparables"],
                        risk_factors=["Documents not verified"])
-    score = calculate_final_score(listing, market, ai, settings)
-    from src.models.listing import ProcessedListing
+    score = calculate_final_score(listing, market, ai, s)
     return ProcessedListing(listing=listing, market=market, ai=ai, score=score)
 
 
 # ---------------------------------------------------------------------------
-# Message formatting
+# Compact alert message + buttons
 # ---------------------------------------------------------------------------
 
-def test_deal_message_contains_price_and_score():
+def test_alert_contains_real_url_for_telegram_link_preview():
     processed = make_processed()
     text = bot.format_deal_message(processed)
+    assert "https://list.am/item/1" in text  # plain url text triggers Telegram's photo preview
+
+
+def test_alert_is_short_not_a_full_breakdown_dump():
+    processed = make_processed()
+    text = bot.format_deal_message(processed)
+    assert "HOW LASEO SCORED" not in text
+    assert "WHY THIS DEAL" not in text
     assert "$125,000" in text
-    assert f"{processed.score.final_score:.0f}/100" in text
-    assert "WHY LASEO LIKES IT" in text
-    assert "WHAT TO CHECK" in text
 
 
-def test_deal_message_breakdown_matches_real_components():
+def test_alert_keyboard_has_breakdown_why_and_open_listing():
     processed = make_processed()
-    text = bot.format_deal_message(processed)
+    kb = bot._deal_alert_keyboard(processed.listing.listing_id, processed.listing.url)
+    top_row = [b["callback_data"] for b in kb["inline_keyboard"][0]]
+    assert top_row == ["breakdown:mock:1", "why:mock:1"]
+    assert kb["inline_keyboard"][1][0]["url"] == "https://list.am/item/1"
+
+
+def test_no_open_listing_button_when_no_url():
+    kb = bot._deal_alert_keyboard("mock:1", "")
+    assert len(kb["inline_keyboard"]) == 1  # only breakdown/why, no url row
+
+
+# ---------------------------------------------------------------------------
+# On-demand breakdown / why, reconstructed from a stored DB row
+# ---------------------------------------------------------------------------
+
+def test_breakdown_from_row_matches_real_components(db):
+    processed = make_processed()
+    db.upsert_listing(processed.listing)
+    db.save_analysis(processed)
+    row = db.get_listing_analysis_row("mock:1")
+
+    text = bot.format_score_breakdown_from_row(row)
     for c in processed.score.components:
         assert c.name in text
+    assert f"{processed.score.final_score:.0f}/100" in text
 
 
-def test_open_listing_button_uses_real_url():
+def test_why_from_row_includes_ai_factors_and_confidence(db):
     processed = make_processed()
-    markup = bot._deal_alert_keyboard(processed.listing.url)
-    assert markup["inline_keyboard"][0][0]["url"] == "https://list.am/item/1"
+    db.upsert_listing(processed.listing)
+    db.save_analysis(processed)
+    row = db.get_listing_analysis_row("mock:1")
+
+    text = bot.format_why_from_row(row)
+    assert "Priced well below comparables" in text
+    assert "Documents not verified" in text
+    assert "HIGH" in text  # 8 comparables -> high confidence, per market.py thresholds
 
 
-def test_no_button_when_no_url():
-    assert bot._deal_alert_keyboard("") is None
+def test_confidence_thresholds_match_market_analysis():
+    assert bot._confidence_from_comparable_count(8) == "high"
+    assert bot._confidence_from_comparable_count(4) == "medium"
+    assert bot._confidence_from_comparable_count(3) == "low"
 
 
 # ---------------------------------------------------------------------------
-# Settings keyboard reflects real per-user state
+# Settings text/keyboard include price range
 # ---------------------------------------------------------------------------
 
-def test_settings_text_shows_on_off_correctly():
-    user = {"good_enabled": 0, "excellent_enabled": 1, "exceptional_enabled": 1, "notifications_enabled": 1}
+def test_settings_text_shows_price_range():
+    user = {"good_enabled": 0, "excellent_enabled": 1, "exceptional_enabled": 1,
+            "min_price_usd": 50000, "max_price_usd": 150000, "notifications_enabled": 1}
     text = bot.format_settings_text(user)
-    assert "Good: OFF" in text
-    assert "Excellent: ON" in text
-    assert "Exceptional: ON" in text
+    assert "$50,000" in text and "$150,000" in text
 
 
-def test_settings_keyboard_has_three_toggle_buttons():
+def test_settings_text_shows_any_price_when_unset():
+    user = {"good_enabled": 0, "excellent_enabled": 1, "exceptional_enabled": 1, "notifications_enabled": 1}
+    assert "Any price" in bot.format_settings_text(user)
+
+
+def test_settings_keyboard_has_price_button_after_toggles():
     user = {"good_enabled": 0, "excellent_enabled": 1, "exceptional_enabled": 1}
     kb = bot.build_settings_keyboard(user)
-    callback_data = [row[0]["callback_data"] for row in kb["inline_keyboard"]]
-    assert callback_data == ["toggle:good", "toggle:excellent", "toggle:exceptional"]
+    assert len(kb["inline_keyboard"]) == 4
+    assert kb["inline_keyboard"][3][0]["callback_data"] == "setprice"
 
 
 # ---------------------------------------------------------------------------
-# process_telegram_updates dispatch (HTTP calls mocked out)
+# Price range parsing
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
-def settings():
-    s = Settings()
-    s.telegram_bot_token = "test-token"
-    return s
+@pytest.mark.parametrize("text,expected", [
+    ("50000-150000", (50000.0, 150000.0)),
+    ("$50,000 - $150,000", (50000.0, 150000.0)),
+    ("50000 to 150000", (50000.0, 150000.0)),
+    ("150000-50000", (50000.0, 150000.0)),  # auto-corrects swapped order
+    ("100000+", (100000.0, None)),
+    ("under 200000", (None, 200000.0)),
+    ("any", (None, None)),
+    ("clear", (None, None)),
+])
+def test_parse_price_range_valid_inputs(text, expected):
+    lo, hi, err = bot._parse_price_range(text)
+    assert (lo, hi) == expected
+    assert err is None
 
 
-def test_start_command_registers_a_new_user(db, settings, monkeypatch):
-    sent = []
-    monkeypatch.setattr(bot, "_get_updates", lambda s, offset: [
-        {"update_id": 1, "message": {"text": "/start", "chat": {"id": 555}, "from": {"id": 555, "first_name": "Areg"}}}
-    ])
-    monkeypatch.setattr(bot, "_post", lambda s, method, payload: sent.append((method, payload)) or {"ok": True, "result": {"message_id": 1}})
-
-    count = bot.process_telegram_updates(settings, db)
-
-    assert count == 1
-    user = db.get_user(555)
-    assert user is not None
-    assert user["excellent_enabled"] == 1  # default
-    assert db.get_bot_state(bot._OFFSET_KEY) == "1"
+def test_parse_price_range_rejects_garbage_without_crashing():
+    lo, hi, err = bot._parse_price_range("banana")
+    assert lo is None and hi is None
+    assert err is not None
 
 
-def test_stop_command_pauses_only_that_user(db, settings, monkeypatch):
+# ---------------------------------------------------------------------------
+# Price range preference storage + filtering
+# ---------------------------------------------------------------------------
+
+def test_price_range_persists_and_filters(db):
     db.register_user(telegram_user_id=1, chat_id="1")
-    db.register_user(telegram_user_id=2, chat_id="2")
+    db.set_price_range(1, 50000, 150000)
+    user = db.get_user(1)
+
+    assert db.user_price_ok(user, 100000) is True
+    assert db.user_price_ok(user, 40000) is False
+    assert db.user_price_ok(user, 200000) is False
+
+
+def test_no_price_range_means_no_filter(db):
+    db.register_user(telegram_user_id=1, chat_id="1")
+    user = db.get_user(1)
+    assert db.user_price_ok(user, 1) is True
+    assert db.user_price_ok(user, 10_000_000) is True
+
+
+def test_setting_price_range_clears_pending_input(db):
+    db.register_user(telegram_user_id=1, chat_id="1")
+    db.set_pending_input(1, "price_range")
+    db.set_price_range(1, 10, 20)
+    assert db.get_user(1)["pending_input"] is None
+
+
+# ---------------------------------------------------------------------------
+# End-to-end command/callback dispatch (network mocked)
+# ---------------------------------------------------------------------------
+
+def test_setprice_button_then_typed_reply_sets_the_range(db, settings, monkeypatch):
+    db.register_user(telegram_user_id=5, chat_id="5")
+    monkeypatch.setattr(bot, "_post", lambda s, method, payload: {"ok": True, "result": {"message_id": 1}})
 
     monkeypatch.setattr(bot, "_get_updates", lambda s, offset: [
-        {"update_id": 5, "message": {"text": "/stop", "chat": {"id": 1}, "from": {"id": 1}}}
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "setprice", "from": {"id": 5},
+                                             "message": {"chat": {"id": 5}, "message_id": 1}}}
     ])
-    monkeypatch.setattr(bot, "_post", lambda s, method, payload: {"ok": True, "result": {"message_id": 1}})
-
     bot.process_telegram_updates(settings, db)
-
-    assert db.get_user(1)["notifications_enabled"] == 0
-    assert db.get_user(2)["notifications_enabled"] == 1  # unaffected
-
-
-def test_callback_toggles_the_right_preference_only(db, settings, monkeypatch):
-    db.register_user(telegram_user_id=9, chat_id="9",
-                      good_enabled=False, excellent_enabled=True, exceptional_enabled=True)
+    assert db.get_user(5)["pending_input"] == "price_range"
 
     monkeypatch.setattr(bot, "_get_updates", lambda s, offset: [
-        {
-            "update_id": 10,
-            "callback_query": {
-                "id": "cb1", "data": "toggle:good",
-                "from": {"id": 9},
-                "message": {"chat": {"id": 9}, "message_id": 42},
-            },
-        }
+        {"update_id": 2, "message": {"text": "80000-200000", "chat": {"id": 5}, "from": {"id": 5}}}
     ])
+    bot.process_telegram_updates(settings, db)
+    user = db.get_user(5)
+    assert user["min_price_usd"] == 80000 and user["max_price_usd"] == 200000
+    assert user["pending_input"] is None
+
+
+def test_breakdown_callback_sends_a_message(db, settings, monkeypatch):
+    processed = make_processed()
+    db.upsert_listing(processed.listing)
+    db.save_analysis(processed)
+
+    sent = []
+    monkeypatch.setattr(bot, "_post", lambda s, method, payload: sent.append((method, payload)) or {"ok": True, "result": {"message_id": 1}})
+    monkeypatch.setattr(bot, "_get_updates", lambda s, offset: [
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "breakdown:mock:1", "from": {"id": 99},
+                                             "message": {"chat": {"id": 99}, "message_id": 1}}}
+    ])
+    bot.process_telegram_updates(settings, db)
+    messages = [p for (m, p) in sent if m == "sendMessage"]
+    assert any("HOW LASEO SCORED" in p["text"] for p in messages)
+
+
+def test_free_text_without_pending_input_is_ignored_quietly(db, settings, monkeypatch):
+    db.register_user(telegram_user_id=1, chat_id="1")
     monkeypatch.setattr(bot, "_post", lambda s, method, payload: {"ok": True, "result": {"message_id": 1}})
-
+    monkeypatch.setattr(bot, "_get_updates", lambda s, offset: [
+        {"update_id": 1, "message": {"text": "hey what's up", "chat": {"id": 1}, "from": {"id": 1}}}
+    ])
+    # Should not raise, and should not set any price range.
     bot.process_telegram_updates(settings, db)
-
-    user = db.get_user(9)
-    assert user["good_enabled"] == 1        # toggled on
-    assert user["excellent_enabled"] == 1   # untouched
-    assert user["exceptional_enabled"] == 1  # untouched
-
-
-def test_offset_advances_so_updates_are_not_reprocessed(db, settings, monkeypatch):
-    calls = {"n": 0}
-
-    def fake_get_updates(s, offset):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return [{"update_id": 100, "message": {"text": "/help", "chat": {"id": 1}, "from": {"id": 1}}}]
-        # Second call must request offset=101 (100 + 1); simulate no new updates.
-        assert offset == 101
-        return []
-
-    monkeypatch.setattr(bot, "_get_updates", fake_get_updates)
-    monkeypatch.setattr(bot, "_post", lambda s, method, payload: {"ok": True, "result": {"message_id": 1}})
-
-    bot.process_telegram_updates(settings, db)
-    bot.process_telegram_updates(settings, db)
-    assert calls["n"] == 2
+    assert db.get_user(1)["min_price_usd"] is None

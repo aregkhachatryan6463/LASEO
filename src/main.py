@@ -163,6 +163,7 @@ def _process_new_listing(listing: Listing, settings: Settings, db: Database, ai_
         recipients = [
             user for user in db.get_active_users()
             if db.user_wants_classification(user, score.classification)
+            and db.user_price_ok(user, listing.price)
         ]
         newly_sent = 0
         for user in recipients:

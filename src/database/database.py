@@ -49,6 +49,14 @@ class Database:
         if "formula_version" not in analysis_cols:
             conn.execute("ALTER TABLE analysis ADD COLUMN formula_version TEXT")
 
+        user_cols = {row[1] for row in conn.execute("PRAGMA table_info(telegram_users)").fetchall()}
+        if "min_price_usd" not in user_cols:
+            conn.execute("ALTER TABLE telegram_users ADD COLUMN min_price_usd REAL")
+        if "max_price_usd" not in user_cols:
+            conn.execute("ALTER TABLE telegram_users ADD COLUMN max_price_usd REAL")
+        if "pending_input" not in user_cols:
+            conn.execute("ALTER TABLE telegram_users ADD COLUMN pending_input TEXT")
+
     # -- new-listing detection ------------------------------------------------
 
     def listing_exists(self, listing_id: str) -> bool:
@@ -395,6 +403,40 @@ class Database:
         if user.get("exceptional_enabled"):
             out.append("EXCEPTIONAL")
         return out
+
+    def user_price_ok(self, user: dict, price: Optional[float]) -> bool:
+        """True if the listing's price is within this user's range (no range set = no limit)."""
+        if price is None:
+            return True
+        min_price = user.get("min_price_usd")
+        max_price = user.get("max_price_usd")
+        if min_price is not None and price < min_price:
+            return False
+        if max_price is not None and price > max_price:
+            return False
+        return True
+
+    def set_price_range(self, telegram_user_id: int, min_price: Optional[float], max_price: Optional[float]) -> Optional[dict]:
+        now = _now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE telegram_users
+                SET min_price_usd = ?, max_price_usd = ?, pending_input = NULL,
+                    updated_at = ?, last_seen_at = ?
+                WHERE telegram_user_id = ?
+                """,
+                (min_price, max_price, now, now, telegram_user_id),
+            )
+        return self.get_user(telegram_user_id)
+
+    def set_pending_input(self, telegram_user_id: int, value: Optional[str]) -> None:
+        now = _now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE telegram_users SET pending_input = ?, updated_at = ? WHERE telegram_user_id = ?",
+                (value, now, telegram_user_id),
+            )
 
     # -- Per-user deliveries ---------------------------------------------------
 
