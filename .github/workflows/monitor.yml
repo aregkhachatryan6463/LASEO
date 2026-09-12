@@ -54,11 +54,42 @@ jobs:
           CITY: ${{ vars.CITY || 'Yerevan' }}
         run: python -m src.main --production
 
-      - name: Commit updated database (persistence across runs)
+      - name: Commit updated database (persistence across runs, race-safe)
         run: |
           git config user.name "real-estate-deal-finder-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add data/listings.db
-          # Only commit if something actually changed, to avoid empty commits every 5 minutes.
-          git diff --cached --quiet || git commit -m "Update listings database [skip ci]"
-          git push
+
+          # Keep a copy of the data we just computed so we can re-apply it
+          # even if we need to catch up to commits another run (or a human
+          # push) made in the meantime.
+          cp data/listings.db /tmp/listings.db
+
+          success=false
+          for attempt in 1 2 3 4 5; do
+            git fetch origin main
+            git reset --hard origin/main
+            cp /tmp/listings.db data/listings.db
+            git add data/listings.db
+
+            if git diff --cached --quiet; then
+              echo "No database changes to commit."
+              success=true
+              break
+            fi
+
+            git commit -m "Update listings database [skip ci]"
+
+            if git push origin HEAD:main; then
+              echo "Pushed successfully on attempt $attempt."
+              success=true
+              break
+            fi
+
+            echo "Push rejected (another run/push landed first) -- retrying (attempt $attempt)..."
+            sleep $((RANDOM % 10 + 5))
+          done
+
+          if [ "$success" != "true" ]; then
+            echo "Failed to push after multiple attempts."
+            exit 1
+          fi
