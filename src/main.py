@@ -7,8 +7,11 @@ Usage:
                                         data source (DATA_SOURCE in .env)
     python -m src.main --test          run the automated test suite
     python -m src.main --status        print last run stats and exit
-    python -m src.main --commands      run the interactive Telegram command bot
-                                        (long-running; not for GitHub Actions)
+    python -m src.main --commands      process any pending Telegram commands/
+                                        button taps once and exit (the 5-minute
+                                        monitoring cycle already does this
+                                        automatically; use this only for
+                                        manual/local testing)
 """
 from __future__ import annotations
 
@@ -25,9 +28,9 @@ from src.sources.mock import MockListingSource
 from src.sources.listam import ListAmSource
 from src.analysis.filters import passes_basic_filters, should_trigger_ai
 from src.analysis.market import analyze_market
-from src.analysis.scoring import calculate_final_score
+from src.analysis.scoring import calculate_final_score, ALERT_CLASSIFICATIONS
 from src.ai.analyzer import AIAnalyzer
-from src.telegram.bot import send_deal_alert, send_daily_summary
+from src.telegram.bot import send_deal_alert, send_daily_summary, process_telegram_updates
 from src.utils.currency import CurrencyConverter
 from src.utils.logging import setup_logging
 
@@ -64,6 +67,25 @@ def run_monitoring_cycle(settings: Settings, source, logger, run_index_for_mock:
     ai_analyzer = AIAnalyzer(settings)
 
     logger.info("Monitoring started")
+
+    # Make sure the original operator (TELEGRAM_CHAT_ID) has a row in
+    # telegram_users so they keep receiving alerts under the new multi-user
+    # system -- this preserves the existing behavior of the last month
+    # without requiring them to send /start themselves. No-op if already
+    # registered, and never overwrites existing preferences.
+    db.bootstrap_legacy_subscriber(
+        settings.telegram_chat_id,
+        good_enabled=settings.default_good_enabled,
+        excellent_enabled=settings.default_excellent_enabled,
+        exceptional_enabled=settings.default_exceptional_enabled,
+    )
+
+    # Handle any /start, /settings, /stop, /top, /today, /status, /how, /help
+    # commands and inline-button taps that arrived since the last cycle.
+    # Short poll only -- no long-running bot process required.
+    updates_processed = process_telegram_updates(settings, db)
+    if updates_processed:
+        logger.info(f"Processed {updates_processed} Telegram update(s)")
 
     try:
         raw_listings = source.fetch_listings(settings.city, settings.property_types)
@@ -134,12 +156,31 @@ def _process_new_listing(listing: Listing, settings: Settings, db: Database, ai_
     processed = ProcessedListing(listing=listing, market=market, ai=ai, score=score)
     db.save_analysis(processed)
 
-    if score.final_score >= settings.min_deal_score and not db.was_telegram_sent(listing.listing_id):
-        message_id = send_deal_alert(settings, processed)
-        db.mark_processed(listing.listing_id, telegram_sent=True, telegram_message_id=message_id)
-        logger.info(f"Telegram alert sent for listing {listing.listing_id} (score={score.final_score})")
+    # The listing is detected, scored, and stored regardless of anyone's
+    # notification preferences -- preferences only affect who gets pinged.
+    sent_to_anyone = False
+    if score.classification in ALERT_CLASSIFICATIONS:
+        recipients = [
+            user for user in db.get_active_users()
+            if db.user_wants_classification(user, score.classification)
+        ]
+        newly_sent = 0
+        for user in recipients:
+            if db.was_alert_delivered(listing.listing_id, user["telegram_user_id"]):
+                continue  # never re-send the same listing to the same user
+            send_deal_alert(settings, processed, chat_id=user["chat_id"])
+            db.record_delivery(listing.listing_id, user["telegram_user_id"], score.classification)
+            sent_to_anyone = True
+            newly_sent += 1
+        logger.info(
+            f"Listing {listing.listing_id} classified {score.classification} "
+            f"(score={score.final_score}); {newly_sent} new alert(s) sent "
+            f"({len(recipients)} total recipient(s) want this classification)"
+        )
     else:
-        db.mark_processed(listing.listing_id, telegram_sent=False, telegram_message_id=None)
+        logger.info(f"Listing {listing.listing_id} scored {score.final_score} ({score.classification}); no alert")
+
+    db.mark_processed(listing.listing_id, telegram_sent=sent_to_anyone, telegram_message_id=None)
 
 
 def main():
@@ -149,7 +190,7 @@ def main():
     group.add_argument("--production", action="store_true", help="Run one cycle against the real data source")
     group.add_argument("--test", action="store_true", help="Run the automated test suite")
     group.add_argument("--status", action="store_true", help="Print last run stats and exit")
-    group.add_argument("--commands", action="store_true", help="Run the interactive Telegram command bot")
+    group.add_argument("--commands", action="store_true", help="Process pending Telegram commands/button taps once and exit")
     parser.add_argument("--mock-run-index", type=int, default=0, help="Which batch of mock listings to reveal (demo of new-listing detection)")
     args = parser.parse_args()
 
@@ -166,9 +207,13 @@ def main():
         return
 
     if args.commands:
-        from src.telegram.bot import run_command_bot
+        # One-shot: process whatever Telegram commands/button taps are
+        # currently pending and exit. This is the same function the 5-minute
+        # monitoring cycle calls automatically -- run it manually here only
+        # if you want to test commands without waiting for the next cycle.
         db = Database(settings.database_path)
-        run_command_bot(settings, db)
+        count = process_telegram_updates(settings, db)
+        print(f"Processed {count} Telegram update(s).")
         return
 
     if args.mock:
