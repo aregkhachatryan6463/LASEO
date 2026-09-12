@@ -97,11 +97,44 @@ class AIAssessment:
 
 
 @dataclass
+class ScoreComponent:
+    """One weighted factor in the deal score. contribution = raw_score * weight."""
+    key: str
+    name: str
+    raw_score: float          # 0-100
+    weight: float             # 0-1, share of the final score
+    contribution: float       # raw_score * weight
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "key": self.key,
+            "name": self.name,
+            "raw_score": self.raw_score,
+            "weight": self.weight,
+            "contribution": self.contribution,
+        }
+
+
+@dataclass
 class DealScore:
     rule_score: float = 0.0
     ai_score: float = 0.0
     final_score: float = 0.0
     classification: str = "IGNORE"   # EXCEPTIONAL, EXCELLENT, GOOD, INTERESTING, IGNORE
+    components: List[ScoreComponent] = field(default_factory=list)
+    penalties: List[ScoreComponent] = field(default_factory=list)
+    formula_version: str = ""
+
+    def to_breakdown_dict(self) -> Dict[str, Any]:
+        return {
+            "final_score": self.final_score,
+            "classification": self.classification,
+            "formula_version": self.formula_version,
+            "rule_score": self.rule_score,
+            "ai_score": self.ai_score,
+            "components": [c.to_dict() for c in self.components],
+            "penalties": [p.to_dict() for p in self.penalties],
+        }
 
 
 @dataclass

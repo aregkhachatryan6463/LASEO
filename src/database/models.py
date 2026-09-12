@@ -82,4 +82,38 @@ CREATE TABLE IF NOT EXISTS run_stats (
     ai_analyzed INTEGER,
     deals_found INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS telegram_users (
+    telegram_user_id INTEGER PRIMARY KEY,
+    chat_id TEXT NOT NULL,
+    username TEXT,
+    first_name TEXT,
+    good_enabled INTEGER NOT NULL DEFAULT 0,
+    excellent_enabled INTEGER NOT NULL DEFAULT 1,
+    exceptional_enabled INTEGER NOT NULL DEFAULT 1,
+    notifications_enabled INTEGER NOT NULL DEFAULT 1,
+    blocked INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT,
+    updated_at TEXT,
+    last_seen_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_telegram_users_chat_id ON telegram_users(chat_id);
+CREATE INDEX IF NOT EXISTS idx_telegram_users_active ON telegram_users(notifications_enabled, blocked);
+
+CREATE TABLE IF NOT EXISTS alert_deliveries (
+    listing_id TEXT NOT NULL,
+    telegram_user_id INTEGER NOT NULL,
+    sent_at TEXT,
+    deal_classification TEXT,
+    PRIMARY KEY (listing_id, telegram_user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_deliveries_user ON alert_deliveries(telegram_user_id);
+CREATE INDEX IF NOT EXISTS idx_alert_deliveries_listing ON alert_deliveries(listing_id);
+
+CREATE TABLE IF NOT EXISTS bot_state (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
 """

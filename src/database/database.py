@@ -39,6 +39,15 @@ class Database:
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(SCHEMA_SQL)
+            self._migrate(conn)
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Additive migrations. Never drop production tables."""
+        analysis_cols = {row[1] for row in conn.execute("PRAGMA table_info(analysis)").fetchall()}
+        if "score_breakdown" not in analysis_cols:
+            conn.execute("ALTER TABLE analysis ADD COLUMN score_breakdown TEXT")
+        if "formula_version" not in analysis_cols:
+            conn.execute("ALTER TABLE analysis ADD COLUMN formula_version TEXT")
 
     # -- new-listing detection ------------------------------------------------
 
@@ -108,8 +117,9 @@ class Database:
                     listing_id, market_average_price, market_median_price, comparable_count,
                     estimated_market_price, estimated_market_price_per_sqm, discount_percentage,
                     rule_score, ai_score, final_deal_score, deal_classification,
-                    ai_summary, ai_positive_factors, ai_risk_factors, ai_confidence, analyzed_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ai_summary, ai_positive_factors, ai_risk_factors, ai_confidence, analyzed_at,
+                    score_breakdown, formula_version
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(listing_id) DO UPDATE SET
                     market_average_price=excluded.market_average_price,
                     market_median_price=excluded.market_median_price,
@@ -122,7 +132,9 @@ class Database:
                     deal_classification=excluded.deal_classification,
                     ai_summary=excluded.ai_summary, ai_positive_factors=excluded.ai_positive_factors,
                     ai_risk_factors=excluded.ai_risk_factors, ai_confidence=excluded.ai_confidence,
-                    analyzed_at=excluded.analyzed_at
+                    analyzed_at=excluded.analyzed_at,
+                    score_breakdown=excluded.score_breakdown,
+                    formula_version=excluded.formula_version
                 """,
                 (
                     processed.listing.listing_id,
@@ -138,6 +150,8 @@ class Database:
                     json.dumps(processed.ai.positive_factors, ensure_ascii=False),
                     json.dumps(processed.ai.risk_factors, ensure_ascii=False),
                     processed.ai.confidence, now,
+                    json.dumps(processed.score.to_breakdown_dict(), ensure_ascii=False),
+                    processed.score.formula_version,
                 ),
             )
 
@@ -185,28 +199,54 @@ class Database:
             ).fetchone()
             return dict(row) if row else None
 
-    def get_top_deals(self, limit: int = 10, since_iso: Optional[str] = None) -> List[dict]:
+    def get_top_deals(
+        self,
+        limit: int = 10,
+        since_iso: Optional[str] = None,
+        classifications: Optional[List[str]] = None,
+    ) -> List[dict]:
         with self._connect() as conn:
+            clauses = []
+            params: list = []
             if since_iso:
-                rows = conn.execute(
-                    """
-                    SELECT l.*, a.* FROM listings l
-                    JOIN analysis a ON a.listing_id = l.listing_id
-                    WHERE a.analyzed_at >= ?
-                    ORDER BY a.final_deal_score DESC LIMIT ?
-                    """,
-                    (since_iso, limit),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """
-                    SELECT l.*, a.* FROM listings l
-                    JOIN analysis a ON a.listing_id = l.listing_id
-                    ORDER BY a.final_deal_score DESC LIMIT ?
-                    """,
-                    (limit,),
-                ).fetchall()
+                clauses.append("a.analyzed_at >= ?")
+                params.append(since_iso)
+            if classifications:
+                placeholders = ",".join("?" * len(classifications))
+                clauses.append(f"a.deal_classification IN ({placeholders})")
+                params.extend(classifications)
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            params.append(limit)
+            rows = conn.execute(
+                f"""
+                SELECT l.*, a.final_deal_score, a.deal_classification, a.discount_percentage,
+                       a.comparable_count, a.estimated_market_price, a.estimated_market_price_per_sqm,
+                       a.score_breakdown, a.formula_version, a.ai_summary, a.ai_positive_factors,
+                       a.ai_risk_factors, a.ai_confidence, a.analyzed_at
+                FROM listings l
+                JOIN analysis a ON a.listing_id = l.listing_id
+                {where}
+                ORDER BY a.final_deal_score DESC LIMIT ?
+                """,
+                params,
+            ).fetchall()
             return [dict(r) for r in rows]
+
+    def get_listing_analysis_row(self, listing_id: str) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT l.*, a.final_deal_score, a.deal_classification, a.discount_percentage,
+                       a.comparable_count, a.estimated_market_price, a.estimated_market_price_per_sqm,
+                       a.market_median_price, a.score_breakdown, a.formula_version,
+                       a.ai_summary, a.ai_positive_factors, a.ai_risk_factors, a.ai_confidence
+                FROM listings l
+                JOIN analysis a ON a.listing_id = l.listing_id
+                WHERE l.listing_id = ?
+                """,
+                (listing_id,),
+            ).fetchone()
+            return dict(row) if row else None
 
     def get_comparables(self, city: str, district: str, property_type: str, exclude_id: str = None) -> List[dict]:
         """Fetch stored listings usable as comparables for market analysis."""
@@ -221,3 +261,212 @@ class Database:
                 (city, district, property_type, exclude_id, exclude_id),
             ).fetchall()
             return [dict(r) for r in rows]
+
+    # -- Telegram users --------------------------------------------------------
+
+    def get_user(self, telegram_user_id: int) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM telegram_users WHERE telegram_user_id = ?",
+                (telegram_user_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_user_by_chat_id(self, chat_id: str) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM telegram_users WHERE chat_id = ? LIMIT 1",
+                (str(chat_id),),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def register_user(
+        self,
+        telegram_user_id: int,
+        chat_id: str,
+        username: Optional[str] = None,
+        first_name: Optional[str] = None,
+        good_enabled: bool = False,
+        excellent_enabled: bool = True,
+        exceptional_enabled: bool = True,
+    ) -> dict:
+        """Create user with defaults if new; preserve prefs if existing. Reactivate on /start."""
+        now = _now_iso()
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT * FROM telegram_users WHERE telegram_user_id = ?",
+                (telegram_user_id,),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE telegram_users SET
+                        chat_id = ?, username = ?, first_name = ?,
+                        last_seen_at = ?, updated_at = ?,
+                        blocked = 0, notifications_enabled = 1
+                    WHERE telegram_user_id = ?
+                    """,
+                    (str(chat_id), username, first_name, now, now, telegram_user_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO telegram_users (
+                        telegram_user_id, chat_id, username, first_name,
+                        good_enabled, excellent_enabled, exceptional_enabled,
+                        notifications_enabled, blocked,
+                        created_at, updated_at, last_seen_at
+                    ) VALUES (?,?,?,?,?,?,?,?,0,?,?,?)
+                    """,
+                    (
+                        telegram_user_id, str(chat_id), username, first_name,
+                        int(good_enabled), int(excellent_enabled), int(exceptional_enabled),
+                        1, now, now, now,
+                    ),
+                )
+        return self.get_user(telegram_user_id)
+
+    def touch_user(self, telegram_user_id: int, chat_id: Optional[str] = None) -> None:
+        now = _now_iso()
+        with self._connect() as conn:
+            if chat_id:
+                conn.execute(
+                    "UPDATE telegram_users SET last_seen_at = ?, chat_id = ? WHERE telegram_user_id = ?",
+                    (now, str(chat_id), telegram_user_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE telegram_users SET last_seen_at = ? WHERE telegram_user_id = ?",
+                    (now, telegram_user_id),
+                )
+
+    def update_user_pref(self, telegram_user_id: int, field: str, value: bool) -> Optional[dict]:
+        allowed = {
+            "good_enabled", "excellent_enabled", "exceptional_enabled",
+            "notifications_enabled", "blocked",
+        }
+        if field not in allowed:
+            raise ValueError(f"Invalid user pref field: {field}")
+        now = _now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                f"UPDATE telegram_users SET {field} = ?, updated_at = ?, last_seen_at = ? WHERE telegram_user_id = ?",
+                (int(value), now, now, telegram_user_id),
+            )
+        return self.get_user(telegram_user_id)
+
+    def mark_user_blocked(self, telegram_user_id: int) -> None:
+        self.update_user_pref(telegram_user_id, "blocked", True)
+
+    def set_notifications_enabled(self, telegram_user_id: int, enabled: bool) -> Optional[dict]:
+        return self.update_user_pref(telegram_user_id, "notifications_enabled", enabled)
+
+    def get_active_users(self) -> List[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM telegram_users
+                WHERE notifications_enabled = 1 AND blocked = 0
+                """
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def user_wants_classification(self, user: dict, classification: str) -> bool:
+        if not user:
+            return False
+        if not user.get("notifications_enabled") or user.get("blocked"):
+            return False
+        mapping = {
+            "GOOD": "good_enabled",
+            "EXCELLENT": "excellent_enabled",
+            "EXCEPTIONAL": "exceptional_enabled",
+        }
+        field = mapping.get(classification)
+        if not field:
+            return False
+        return bool(user.get(field))
+
+    def enabled_classifications_for_user(self, user: dict) -> List[str]:
+        out = []
+        if user.get("good_enabled"):
+            out.append("GOOD")
+        if user.get("excellent_enabled"):
+            out.append("EXCELLENT")
+        if user.get("exceptional_enabled"):
+            out.append("EXCEPTIONAL")
+        return out
+
+    # -- Per-user deliveries ---------------------------------------------------
+
+    def was_alert_delivered(self, listing_id: str, telegram_user_id: int) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM alert_deliveries WHERE listing_id = ? AND telegram_user_id = ?",
+                (listing_id, telegram_user_id),
+            ).fetchone()
+            return row is not None
+
+    def record_delivery(self, listing_id: str, telegram_user_id: int, classification: str) -> bool:
+        """Returns True if a new row was inserted, False if already delivered."""
+        now = _now_iso()
+        with self._connect() as conn:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO alert_deliveries (listing_id, telegram_user_id, sent_at, deal_classification)
+                    VALUES (?,?,?,?)
+                    """,
+                    (listing_id, telegram_user_id, now, classification),
+                )
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def bootstrap_legacy_subscriber(
+        self,
+        chat_id: str,
+        good_enabled: bool = False,
+        excellent_enabled: bool = True,
+        exceptional_enabled: bool = True,
+    ) -> Optional[dict]:
+        """
+        If TELEGRAM_CHAT_ID is set in the environment and that chat has no user
+        row yet, create one so the original operator is not silently dropped.
+        Does not overwrite existing preferences.
+        """
+        chat_id = (chat_id or "").strip()
+        if not chat_id:
+            return None
+        existing = self.get_user_by_chat_id(chat_id)
+        if existing:
+            return existing
+        try:
+            user_id = int(chat_id)
+        except ValueError:
+            logger.warning("TELEGRAM_CHAT_ID is set but is not numeric; skipping legacy bootstrap")
+            return None
+        if self.get_user(user_id):
+            return self.get_user(user_id)
+        logger.info("Bootstrapping legacy Telegram subscriber from TELEGRAM_CHAT_ID (prefs not overwritten later)")
+        return self.register_user(
+            telegram_user_id=user_id,
+            chat_id=chat_id,
+            first_name="Legacy subscriber",
+            good_enabled=good_enabled,
+            excellent_enabled=excellent_enabled,
+            exceptional_enabled=exceptional_enabled,
+        )
+
+    # -- Bot getUpdates offset -------------------------------------------------
+
+    def get_bot_state(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT value FROM bot_state WHERE key = ?", (key,)).fetchone()
+            return row["value"] if row else default
+
+    def set_bot_state(self, key: str, value: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO bot_state (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )

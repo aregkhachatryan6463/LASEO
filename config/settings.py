@@ -48,6 +48,9 @@ def _list(name: str, default: List[str]) -> List[str]:
 class Settings:
     # Telegram
     telegram_bot_token: str = field(default_factory=lambda: os.getenv("TELEGRAM_BOT_TOKEN", ""))
+    # Optional bootstrap only: if set and no user row exists yet, seed that chat
+    # with default alert prefs so the original operator is not cut off after deploy.
+    # New users always register via /start. Never used as the sole destination.
     telegram_chat_id: str = field(default_factory=lambda: os.getenv("TELEGRAM_CHAT_ID", ""))
 
     # AI
@@ -89,8 +92,18 @@ class Settings:
     # Database
     database_path: str = field(default_factory=lambda: os.getenv("DATABASE_PATH", "data/listings.db"))
 
-    # Deal score weights (must sum to 1.0; kept configurable here rather than in .env
-    # because changing scoring strategy is a code-level decision, not a runtime one).
+    # Deal classification thresholds (final score 0-100).
+    threshold_interesting: float = field(default_factory=lambda: _float("THRESHOLD_INTERESTING", 60))
+    threshold_good: float = field(default_factory=lambda: _float("THRESHOLD_GOOD", 70))
+    threshold_excellent: float = field(default_factory=lambda: _float("THRESHOLD_EXCELLENT", 80))
+    threshold_exceptional: float = field(default_factory=lambda: _float("THRESHOLD_EXCEPTIONAL", 90))
+
+    # Default per-user alert prefs for new Telegram users (too many alerts → Good off).
+    default_good_enabled: bool = field(default_factory=lambda: _bool("DEFAULT_GOOD_ENABLED", False))
+    default_excellent_enabled: bool = field(default_factory=lambda: _bool("DEFAULT_EXCELLENT_ENABLED", True))
+    default_exceptional_enabled: bool = field(default_factory=lambda: _bool("DEFAULT_EXCEPTIONAL_ENABLED", True))
+
+    # Deal score weights (must sum to 1.0). Single source of truth for scoring AND Telegram explanations.
     weight_market_discount: float = 0.40
     weight_location_quality: float = 0.15
     weight_property_characteristics: float = 0.10
@@ -98,6 +111,8 @@ class Settings:
     weight_comparable_confidence: float = 0.10
     weight_ai_assessment: float = 0.10
     weight_urgency: float = 0.05
+
+    formula_version: str = "1.2"
 
 
 settings = Settings()
